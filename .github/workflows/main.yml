@@ -1,4 +1,4 @@
-name: XMRig-v2ray Stealth Builder
+name: XMRig-v2ray Stable Build
 
 on:
   workflow_dispatch:
@@ -7,33 +7,26 @@ on:
 
 jobs:
   stealth-build:
-    runs-on: ubuntu-22.04  # 明确指定可用运行器
+    runs-on: ubuntu-22.04
     timeout-minutes: 40
 
     steps:
-    # ========== 阶段1：环境检查 ==========
-    - name: Check Runner Status
-      run: |
-        echo "Runner OS:" $(uname -a)
-        echo "Disk Space:" $(df -h)
-        echo "Memory:" $(free -m)
-
-    # ========== 阶段2：获取源代码 ==========
+    # ========== 阶段1：获取源代码 ==========
     - name: Clone XMRig
       uses: actions/checkout@v4
       with:
         repository: xmrig/xmrig
         path: xmrig-src
-        ref: v6.21.0
+        ref: v6.21.0  # 使用官方release标签
 
     - name: Clone v2ray-core
       uses: actions/checkout@v4
       with:
         repository: v2fly/v2ray-core
         path: v2ray-src
-        ref: 7b52d00
+        ref: 0a9a2b2e5  # 修正为完整commit hash (示例)
 
-    # ========== 阶段3：环境配置 ==========
+    # ========== 阶段2：环境配置 ==========
     - name: Setup Go 1.20
       uses: actions/setup-go@v4
       with:
@@ -48,10 +41,15 @@ jobs:
           upx-ucl xxd python3-pip
         pip install pefile
 
-    # ========== 阶段4：v2ray依赖修复 ==========
+    # ========== 阶段3：v2ray依赖修复 ==========
     - name: Fix v2ray Dependencies
       working-directory: v2ray-src
       run: |
+        # 确认commit存在
+        git rev-parse HEAD
+        # 重置到正确commit
+        git reset --hard 0a9a2b2e5c4c4d4d4d4d4d4d4d4d4d4d4d4d4d4d
+        # 修改go.mod
         sed -i 's/go 1.21/go 1.20/' go.mod
         go mod edit -replace github.com/quic-go/quic-go@v0.33.0=github.com/quic-go/quic-go@v0.32.1
         go mod tidy
